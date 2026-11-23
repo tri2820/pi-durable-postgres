@@ -30,7 +30,7 @@ application's package manager, not `pi install`.
 | 0.3.0 (this fork) | 1.5.2 / 1.5.2 | Bun (tests), Node.js >=22.19.0 (library) | PostgreSQL 17 tested |
 
 Peer versions are pinned to the validated upstream release. Tests run with Bun:
-`bun test` against `docker compose up -d postgres` (port 5433) or any database in
+`bun test` against `podman compose up -d postgres` (port 5433) or any database in
 `PI_DURABLE_POSTGRES_TEST_URL`. Other PostgreSQL versions and drivers are not yet
 validated. ESM JavaScript and TypeScript declarations are published; no CommonJS
 build is provided.
@@ -237,7 +237,7 @@ consumer smoke test installs that peer explicitly; it is not a storage dependenc
 ```bash
 corepack enable
 pnpm install --frozen-lockfile
-docker compose up -d --wait  # PostgreSQL 17, loopback port 5433
+podman compose up -d --wait  # PostgreSQL 17, loopback port 5433
 pnpm lint:types             # source AND tests
 pnpm test                   # upstream conformance + adapter/purge/migration regressions
 pnpm test:package           # packs, installs and type-checks a fresh consumer (needs npm network access)
