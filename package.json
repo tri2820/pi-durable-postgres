@@ -35,8 +35,8 @@
     "build": "tsc",
     "test": "bun test",
     "test:types": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "db:up": "docker compose up -d postgres",
-    "db:down": "docker compose down"
+    "db:up": "podman compose up -d postgres",
+    "db:down": "podman compose down"
   },
   "peerDependencies": {
     "@earendil-works/chord": ">=1.5.2 <2",

@@ -10,7 +10,7 @@ Use Node >=22.19.0 and the pnpm version in package.json:
 ```bash
 corepack enable
 pnpm install --frozen-lockfile
-docker compose up -d --wait
+podman compose up -d --wait
 pnpm lint:types
 pnpm test
 pnpm test:package
