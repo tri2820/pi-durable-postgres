@@ -62,6 +62,8 @@ type IdRow = { readonly id: number };
 type MetadataRow = { readonly next_id: number; readonly next_seq: number };
 type DocumentAction = {
 	create?: DocumentCreate;
+	/** The stored record, read once by the checks. Absent for a creation. */
+	existing?: DocumentRecord;
 	copy?: Extract<StorageWrite, { readonly type: "document.copy" }>["source"];
 	content?: DocumentContent;
 	retire: boolean;
@@ -251,8 +253,7 @@ export class PostgresStorage implements Storage {
 				}
 
 				const seq = seqFromNumber(next++);
-				for (const write of writes) await this.applyTableWrite(transaction, write, seq);
-				await this.applyDocumentActions(transaction, checked.actions, seq);
+				await this.applyBatch(transaction, writes, checked.actions, seq);
 				seqs.push(seq);
 				candidateNextId = Math.max(candidateNextId, this.candidateNextId(writes));
 			}
@@ -800,15 +801,27 @@ export class PostgresStorage implements Storage {
 	}
 
 	private async checkGlobalIds(executor: PostgresExecutor, writes: readonly StorageWrite[]): Promise<void> {
-		const claimed = new Map<Id<string>, TableName>();
+		const wanted = new Map<Id<string>, TableName>();
 		for (const write of writes) {
 			if (write.type === "document.change" || write.type === "document.retire") continue;
 			const document = write.type === "document.create" || write.type === "document.copy";
 			const table: TableName = document ? "document" : write.type;
 			const id = document ? write.record.id : write.value.id;
-			const existing = (
-				await executor.get<RecordIdRow>("SELECT record_type FROM record_ids WHERE id = $1", [id])
-			)?.record_type;
+			wanted.set(id, table);
+		}
+		if (wanted.size === 0) return;
+
+		// One question for every id the batch claims, instead of one per id.
+		const stored = await executor.all<RecordIdRow & { readonly id: number }>(
+			"SELECT id, record_type FROM record_ids WHERE id = ANY($1::bigint[])",
+			[[...wanted.keys()]],
+		);
+		const taken = new Map<number, TableName>();
+		for (const row of stored) taken.set(Number(row.id), row.record_type);
+
+		const claimed = new Map<Id<string>, TableName>();
+		for (const [id, table] of wanted) {
+			const existing = taken.get(Number(id));
 			const earlier = claimed.get(id);
 			if (table === "conversation" || table === "entry" || table === "document") {
 				if (existing !== undefined) refuse(`ID ${id} already belongs to ${existing}`);
@@ -880,6 +893,7 @@ export class PostgresStorage implements Storage {
 			}
 			const row = await executor.get<JsonRow>("SELECT record FROM documents WHERE id = $1", [id]);
 			const existing = row === undefined ? undefined : parseJson<DocumentRecord>(row.record);
+			if (existing !== undefined) action.existing = existing;
 			if (action.create === undefined && existing === undefined) refuse(`Unknown document: ${id}`);
 			if (action.create !== undefined && existing !== undefined) refuse(`Document ${id} already exists`);
 			if (existing?.retiredAt !== undefined) refuse(`Document ${id} is retired`);
@@ -893,6 +907,9 @@ export class PostgresStorage implements Storage {
 					refuse(`Document ${id} version transition requires a base`);
 				}
 			}
+			// A plain change keeps its own incarnation: only a creation or a retirement
+			// can add or remove one, so only those need the address lookup.
+			if (action.create === undefined && !action.retire) continue;
 			const record = action.create ?? existing!;
 			const key = addressKey(record);
 			let live = liveCounts.get(key);
@@ -922,79 +939,154 @@ export class PostgresStorage implements Storage {
 		return id === undefined ? undefined : idFromNumber<DocumentId>(id);
 	}
 
-	private async applyTableWrite(executor: PostgresExecutor, write: StorageWrite, seq: Seq): Promise<void> {
-		switch (write.type) {
-			case "conversation":
-				await this.claimId(executor, write.value.id, "conversation");
-				await executor.run(
-					"INSERT INTO conversations (id, owner_conversation_id, owner_task_id, record) VALUES ($1, $2, $3, $4)",
-					[
-						write.value.id,
-						write.value.owner?.conversationId ?? null,
-						write.value.owner?.taskId ?? null,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "entry":
-				await this.claimId(executor, write.value.id, "entry");
-				await executor.run(
-					"INSERT INTO entries (id, conversation_id, head, commit_seq, record) VALUES ($1, $2, $3, $4, $5)",
-					[
-						write.value.id,
-						write.value.conversationId,
-						write.value.head ?? null,
-						seq,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "task":
-				await this.claimId(executor, write.value.id, "task");
-				await executor.run(
-					`INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)
-						VALUES ($1, $2, $3, $4, $5, $6, $7)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
-						status = excluded.status, abort_requested = excluded.abort_requested,
-						background = excluded.background, record = excluded.record`,
-					[
-						write.value.id,
-						write.value.conversationId,
-						encodeIndexedString(write.value.kind),
-						write.value.state.status,
-						write.value.abortRequested,
-						write.value.background,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "submission":
-				await this.claimId(executor, write.value.id, "submission");
-				await executor.run(
-					`INSERT INTO submissions (id, conversation_id, request_id, status, record) VALUES ($1, $2, $3, $4, $5)
-						ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
-						request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
-					[
-						write.value.id,
-						write.value.conversationId,
-						write.value.requestId === undefined ? null : encodeIndexedString(write.value.requestId),
-						write.value.status,
-						encodeJson(write.value),
-					],
-				);
-				break;
-			case "document.create":
-			case "document.copy":
-			case "document.change":
-			case "document.retire":
-				break;
+	/**
+	 * Write one checked batch in as few statements as the schema allows: one claim
+	 * insert, one insert per record table, then the documents. A remote database
+	 * charges per round trip, and one turn makes many batches.
+	 */
+	private async applyBatch(
+		executor: PostgresExecutor,
+		writes: readonly StorageWrite[],
+		actions: ReadonlyMap<DocumentId, DocumentAction>,
+		seq: Seq,
+	): Promise<void> {
+		const claims = new Map<Id<string>, TableName>();
+		const conversations: ConversationRecord[] = [];
+		const entries: EntryRecord[] = [];
+		const tasks = new Map<Id<string>, StoredTask>();
+		const submissions = new Map<Id<string>, SubmissionRecord>();
+
+		for (const write of writes) {
+			switch (write.type) {
+				case "conversation":
+					claims.set(write.value.id, "conversation");
+					conversations.push(write.value);
+					break;
+				case "entry":
+					claims.set(write.value.id, "entry");
+					entries.push(write.value);
+					break;
+				case "task":
+					claims.set(write.value.id, "task");
+					tasks.set(write.value.id, write.value);
+					break;
+				case "submission":
+					claims.set(write.value.id, "submission");
+					submissions.set(write.value.id, write.value);
+					break;
+				case "document.create":
+				case "document.copy":
+					claims.set(write.record.id, "document");
+					break;
+				case "document.change":
+				case "document.retire":
+					break;
+			}
 		}
+		for (const [id, action] of actions) {
+			if (action.create !== undefined) claims.set(id, "document");
+		}
+
+		await this.claimIds(executor, claims);
+		await this.insertConversations(executor, conversations);
+		await this.insertEntries(executor, entries, seq);
+		await this.insertTasks(executor, [...tasks.values()]);
+		await this.insertSubmissions(executor, [...submissions.values()]);
+		await this.applyDocumentActions(executor, actions, seq);
 	}
 
-	private async claimId(executor: PostgresExecutor, id: Id<string>, table: TableName): Promise<void> {
+	private async claimIds(
+		executor: PostgresExecutor,
+		claims: ReadonlyMap<Id<string>, TableName>,
+	): Promise<void> {
+		if (claims.size === 0) return;
+		const ids: Id<string>[] = [];
+		const tables: TableName[] = [];
+		for (const [id, table] of claims) {
+			ids.push(id);
+			tables.push(table);
+		}
 		await executor.run(
-			"INSERT INTO record_ids (id, record_type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
-			[id, table],
+			`INSERT INTO record_ids (id, record_type)
+			 SELECT * FROM unnest($1::bigint[], $2::text[])
+			 ON CONFLICT (id) DO NOTHING`,
+			[ids, tables],
+		);
+	}
+
+	private async insertConversations(
+		executor: PostgresExecutor,
+		rows: readonly ConversationRecord[],
+	): Promise<void> {
+		if (rows.length === 0) return;
+		await executor.run(
+			`INSERT INTO conversations (id, owner_conversation_id, owner_task_id, record)
+			 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[])`,
+			[
+				rows.map((row) => row.id),
+				rows.map((row) => row.owner?.conversationId ?? null),
+				rows.map((row) => row.owner?.taskId ?? null),
+				rows.map((row) => encodeJson(row)),
+			],
+		);
+	}
+
+	private async insertEntries(
+		executor: PostgresExecutor,
+		rows: readonly EntryRecord[],
+		seq: Seq,
+	): Promise<void> {
+		if (rows.length === 0) return;
+		await executor.run(
+			`INSERT INTO entries (id, conversation_id, head, commit_seq, record)
+			 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::text[])`,
+			[
+				rows.map((row) => row.id),
+				rows.map((row) => row.conversationId),
+				rows.map((row) => row.head ?? null),
+				rows.map(() => seq),
+				rows.map((row) => encodeJson(row)),
+			],
+		);
+	}
+
+	private async insertTasks(executor: PostgresExecutor, rows: readonly StoredTask[]): Promise<void> {
+		if (rows.length === 0) return;
+		await executor.run(
+			`INSERT INTO tasks (id, conversation_id, kind, status, abort_requested, background, record)
+			 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::text[], $4::text[], $5::boolean[], $6::boolean[], $7::text[])
+			 ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id, kind = excluded.kind,
+			 status = excluded.status, abort_requested = excluded.abort_requested,
+			 background = excluded.background, record = excluded.record`,
+			[
+				rows.map((row) => row.id),
+				rows.map((row) => row.conversationId),
+				rows.map((row) => encodeIndexedString(row.kind)),
+				rows.map((row) => row.state.status),
+				rows.map((row) => row.abortRequested),
+				rows.map((row) => row.background),
+				rows.map((row) => encodeJson(row)),
+			],
+		);
+	}
+
+	private async insertSubmissions(
+		executor: PostgresExecutor,
+		rows: readonly SubmissionRecord[],
+	): Promise<void> {
+		if (rows.length === 0) return;
+		await executor.run(
+			`INSERT INTO submissions (id, conversation_id, request_id, status, record)
+			 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::text[], $4::text[], $5::text[])
+			 ON CONFLICT(id) DO UPDATE SET conversation_id = excluded.conversation_id,
+			 request_id = excluded.request_id, status = excluded.status, record = excluded.record`,
+			[
+				rows.map((row) => row.id),
+				rows.map((row) => row.conversationId),
+				rows.map((row) => (row.requestId === undefined ? null : encodeIndexedString(row.requestId))),
+				rows.map((row) => row.status),
+				rows.map((row) => encodeJson(row)),
+			],
 		);
 	}
 
@@ -1014,7 +1106,6 @@ export class PostgresStorage implements Storage {
 					...(action.retire ? { retiredAt: seq } : {}),
 				};
 				const parts = addressParts(record);
-				await this.claimId(executor, id, "document");
 				await executor.run(
 					`INSERT INTO documents
 						(id, kind, family, key_value, scope_kind, owner_id, created_at, retired_at, record)
@@ -1032,19 +1123,22 @@ export class PostgresStorage implements Storage {
 					],
 				);
 			} else {
-				const row = (await executor.get<JsonRow>("SELECT record FROM documents WHERE id = $1", [id]))!;
-				record = parseJson<DocumentRecord>(row.record);
+				record = action.existing!;
 			}
 
 			if (content !== undefined) {
-				if (content.kind === "base" && isCurrentOnly(record)) {
-					await executor.run("DELETE FROM document_revisions WHERE document_id = $1", [id]);
-				}
 				const encodedContent = content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops);
-				await executor.run(
-					"INSERT INTO document_revisions (document_id, seq, kind, version, content) VALUES ($1, $2, $3, $4, $5)",
-					[id, seq, content.kind, content.version, encodedContent],
-				);
+				const insert =
+					"INSERT INTO document_revisions (document_id, seq, kind, version, content) VALUES ($1, $2, $3, $4, $5)";
+				if (content.kind === "base" && isCurrentOnly(record)) {
+					// A base replaces the history: drop it and write the new revision in one statement.
+					await executor.run(
+						`WITH gone AS (DELETE FROM document_revisions WHERE document_id = $1) ${insert}`,
+						[id, seq, content.kind, content.version, encodedContent],
+					);
+				} else {
+					await executor.run(insert, [id, seq, content.kind, content.version, encodedContent]);
+				}
 			}
 
 			if (action.retire) {
