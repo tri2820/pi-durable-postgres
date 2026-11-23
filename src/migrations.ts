@@ -98,9 +98,17 @@ const INITIAL_SCHEMA: readonly string[] = [
 	"CREATE INDEX document_revisions_by_kind ON document_revisions (document_id, kind, seq DESC)",
 ];
 
+/** pi-durable 1.4 added the `sleeping` task state; widen the check without rewriting rows. */
+const ADD_SLEEPING_TASK_STATUS: readonly string[] = [
+	"ALTER TABLE tasks DROP CONSTRAINT tasks_status_check",
+	`ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
+		CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal'))`,
+];
+
 /** Immutable, ordered schema history. Append new migrations after the initial schema ships. */
 export const POSTGRES_MIGRATIONS: readonly PostgresMigration[] = [
 	{ version: 1, statements: INITIAL_SCHEMA },
+	{ version: 2, statements: ADD_SLEEPING_TASK_STATUS },
 ];
 
 export const CURRENT_POSTGRES_SCHEMA_VERSION = POSTGRES_MIGRATIONS.at(-1)?.version ?? 0;

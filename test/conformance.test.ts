@@ -1,5 +1,5 @@
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 import { freshStorage } from "./helpers.ts";
 
 // The upstream conformance suite is the acceptance gate for this backend.

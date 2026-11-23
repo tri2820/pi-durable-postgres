@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { Context } from "@earendil-works/chord/context";
+import type { Seq, StorageWrite } from "@earendil-works/pi-durable";
 import pg from "pg";
 import { PostgresStorage } from "../src/storage.js";
 import { nodePostgresDatabase } from "../src/node.js";
@@ -55,6 +57,20 @@ export async function freshStorage() {
 		await fixture.cleanup();
 		throw error;
 	}
+}
+
+/** Commit one batch the way upstream tests do: resolves with its seq, throws a refusal. */
+export async function commitWrites(
+	storage: PostgresStorage,
+	writes: readonly StorageWrite[],
+	context: Context = BACKGROUND_CONTEXT,
+): Promise<Seq> {
+	const seqs: Seq[] = [];
+	const result = await storage.commit([writes], (index, seq) => {
+		seqs[index] = seq;
+	}, context);
+	if (result.refused !== undefined) throw result.refused;
+	return seqs[0]!;
 }
 
 export function deferred() {

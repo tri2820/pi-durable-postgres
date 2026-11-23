@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 — 2026-11-23
+
+Fork: [tri2820/pi-durable-postgres](https://github.com/tri2820/pi-durable-postgres).
+Ported to Pi Durable 1.5.x.
+
+- `Storage.commit(batches, receive, context)` replaces `commit(writes, adopt, context)`:
+  batches are stored in order, each with its own seq, checked against the state the
+  earlier batches left. The first batch Durable's own checks refuse is not stored and
+  neither is anything after it; the batches before it are durable, and the call
+  resolves with `{ stored, refused? }`.
+- Receipts: `receive(index, seq)` is called once per durable batch, in order, after
+  `COMMIT`, before the call resolves.
+- Copy sources are resolved during the checks, before the batch writes, so a refused
+  batch never writes anything.
+- `StorageRejected` is gone. Invalid reads throw `StorageRequestError`, which fails
+  only that read. An internal refusal type separates Durable's checks from storage
+  failures, which reject the whole call and roll every batch back.
+- Migration v2 widens `tasks_status_check` for the `sleeping` task state added in
+  Pi Durable 1.4. Existing migration versions are untouched.
+- Tests run on Bun (`bun test`). Upstream's storage conformance suite remains the
+  acceptance gate and is wired in `test/conformance.test.ts`.
+
+
 ## 0.1.1 — 2026-10-05
 
 - Re-validated against Pi Durable, Chord and Pi AI 1.0.3. Upstream changes include

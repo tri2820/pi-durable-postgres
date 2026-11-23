@@ -1,12 +1,24 @@
-# @netzlabor/pi-durable-postgres
+# @tri2820/pi-durable-postgres
+
+**Fork.** This is [tri2820/pi-durable-postgres](https://github.com/tri2820/pi-durable-postgres),
+a fork of [j-koester/pi-durable-postgres](https://github.com/j-koester/pi-durable-postgres)
+ported to Pi Durable **1.5.x** (upstream targets 1.1.0). The port is:
+
+- `Storage.commit(batches, receive, context)` with per-batch checks, refusal
+  semantics and durability receipts;
+- `StorageRequestError` in place of the removed `StorageRejected`;
+- migration v2 for the `sleeping` task state added in Pi Durable 1.4;
+- the test suite runs on Bun, still gated by upstream's storage conformance suite.
+
+Upstream's MIT licence and copyright are retained (`LICENSE`).
 
 A PostgreSQL storage backend for
 [`@earendil-works/pi-durable`](https://github.com/earendil-works/pi/tree/main/packages/durable).
 This is an **SDK library**, not a Pi Coding Agent extension: install it with your
 application's package manager, not `pi install`.
 
-- **Source:** [j-koester/pi-durable-postgres](https://github.com/j-koester/pi-durable-postgres)
-- **npm package:** `@netzlabor/pi-durable-postgres`
+- **Source:** [tri2820/pi-durable-postgres](https://github.com/tri2820/pi-durable-postgres)
+- **npm package:** not published. Consume it from this repository or a git dependency.
 - **Status:** Alpha. Upstream Pi Durable is experimental; its API can change between releases.
 
 ## Compatibility
@@ -15,9 +27,11 @@ application's package manager, not `pi install`.
 |---|---|---|---|
 | 0.1.0 | 1.0.2 / 1.0.2 | Node.js >=22.19.0 | PostgreSQL 17 tested |
 | 0.1.1 | 1.0.3 / 1.0.3 | Node.js >=22.19.0 | PostgreSQL 17 tested |
+| 0.3.0 (this fork) | 1.5.2 / 1.5.2 | Bun (tests), Node.js >=22.19.0 (library) | PostgreSQL 17 tested |
 
-CI targets Node 22.19.0 and 24. Peer versions are deliberately pinned to the
-validated upstream release. Other PostgreSQL versions and drivers are not yet
+Peer versions are pinned to the validated upstream release. Tests run with Bun:
+`bun test` against `docker compose up -d postgres` (port 5433) or any database in
+`PI_DURABLE_POSTGRES_TEST_URL`. Other PostgreSQL versions and drivers are not yet
 validated. ESM JavaScript and TypeScript declarations are published; no CommonJS
 build is provided.
 
@@ -49,7 +63,7 @@ See the [live-deletion design](docs/live-deletion.md) for the intended integrati
 Install the alpha release:
 
 ```bash
-npm install @netzlabor/pi-durable-postgres @earendil-works/pi-durable@1.0.3 @earendil-works/chord@1.0.3 @earendil-works/pi-ai@1.0.3
+bun add @earendil-works/pi-durable@1.5.2 @earendil-works/chord@1.5.2
 export DATABASE_URL='postgres://app:password@localhost:5432/agent_state'
 ```
 
@@ -57,7 +71,7 @@ export DATABASE_URL='postgres://app:password@localhost:5432/agent_state'
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { Harness, createRegistry } from "@earendil-works/pi-durable";
-import { openNodePostgresStorage } from "@netzlabor/pi-durable-postgres";
+import { openNodePostgresStorage } from "@tri2820/pi-durable-postgres";
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error("Set DATABASE_URL");
@@ -134,7 +148,7 @@ storage tables directly while a Harness owns them.
   It closes storage after the Harness's admitted work settles. Database close drains
   already admitted operations and rejects new ones.
 
-### Progress commits (Pi Durable 1.0.3)
+### Progress commits (Pi Durable 1.5.x)
 
 Remote databases may benefit from less frequent intermediate progress writes.
 Pi Durable 1.0.3 adds a `settings.progress` option to `Harness.open`, for example:

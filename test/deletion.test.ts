@@ -1,10 +1,10 @@
 import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import type { ConversationId, DocumentId, EntryId, StorageWrite, SubmissionId, TaskId } from "@earendil-works/pi-durable";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { PostgresDatabase } from "../src/database.js";
 import { deleteConversation } from "../src/delete.js";
 import type { PostgresStorage } from "../src/storage.js";
-import { freshStorage } from "./helpers.js";
+import { freshStorage, commitWrites } from "./helpers.ts";
 
 const tables = ["conversations", "entries", "tasks", "submissions", "documents", "document_revisions", "record_ids"] as const;
 async function counts(database: PostgresDatabase) {
@@ -38,7 +38,7 @@ async function seed(storage: PostgresStorage) {
 		{ type: "conversation", value: { id: child, parent: { conversationId: root, at: entry } } },
 		{ type: "entry", value: { id: childEntry, conversationId: child, kind: "test" } },
 	];
-	await storage.commit(writes, context);
+	await commitWrites(storage, writes, context);
 	return { root, task, entry, document, child, childEntry };
 }
 
@@ -67,7 +67,7 @@ describe("deleteConversation (exclusive maintenance)", () => {
 		try {
 			const { root, child, childEntry, task } = await seed(fixture.storage);
 			const fork = await fixture.storage.mintId<ConversationId>();
-			await fixture.storage.commit([{ type: "conversation", value: {
+			await commitWrites(fixture.storage, [{ type: "conversation", value: {
 				id: fork, owner: { conversationId: root, taskId: task }, parent: { conversationId: child, at: childEntry },
 			} }], context);
 			await fixture.storage.close(context);
@@ -85,7 +85,7 @@ describe("deleteConversation (exclusive maintenance)", () => {
 			const { root } = await seed(fixture.storage);
 			const unrelated = await fixture.storage.mintId<ConversationId>();
 			const shared = await fixture.storage.mintId<DocumentId>();
-			await fixture.storage.commit([
+			await commitWrites(fixture.storage, [
 				{ type: "conversation", value: { id: unrelated } },
 				{ type: "document.create", record: { id: shared, kind: "shared", scope: { kind: "session" } },
 					content: { kind: "base", version: 1, value: { keep: true } } },
@@ -107,7 +107,7 @@ describe("deleteConversation (exclusive maintenance)", () => {
 				await expect(deleteConversation(database, root, { includeForks: true })).rejects.toThrow(/in use/);
 			}
 			expect(await counts(fixture.database)).toEqual(before);
-			await expect(fixture.storage.commit([], context)).resolves.toBeTypeOf("number");
+			await expect(fixture.storage.commit([], () => {}, context)).resolves.toEqual({ stored: 0 });
 			await fixture.storage.close(context);
 			await expect(deleteConversation(fixture.createDatabase(), root, { includeForks: true })).resolves.toBeDefined();
 		} finally { await fixture.cleanup(); }
@@ -121,7 +121,7 @@ describe("deleteConversation (exclusive maintenance)", () => {
 			const database = fixture.createDatabase();
 			const before = await counts(database);
 			const maintenance = database.transaction.maintenance;
-			const spy = vi.spyOn(database.transaction, "maintenance").mockImplementation((callback) => maintenance((tx) => callback({
+			const spy = spyOn(database.transaction, "maintenance").mockImplementation((callback) => maintenance((tx) => callback({
 				...tx,
 				run: async (sql, params) => {
 					if (sql.startsWith("DELETE FROM tasks")) throw new Error("injected deletion failure");
@@ -156,7 +156,7 @@ describe("deleteConversation (exclusive maintenance)", () => {
 			const { root, task } = await seed(fixture.storage);
 			const outside = await fixture.storage.mintId<ConversationId>();
 			const dependent = await fixture.storage.mintId<TaskId<null>>();
-			await fixture.storage.commit([
+			await commitWrites(fixture.storage, [
 				{ type: "conversation", value: { id: outside } },
 				{ type: "task", value: {
 					id: dependent, conversationId: outside, kind: "dependent", version: 1,
